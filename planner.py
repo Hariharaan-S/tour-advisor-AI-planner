@@ -28,10 +28,13 @@ class CostSummary(BaseModel):
     people_count: int
 
 class TripPlan(BaseModel):
+    title: str
+    description: str
     tourist_spots: List[TouristSpot]
     transport: List[Transport]
     instructions: List[InstructionStep]
     cost_summary: CostSummary
+    people: int
 
 
 # ===============================
@@ -48,6 +51,13 @@ with open("json_files/transport_distance.json", "r", encoding="utf-8") as f:
 # ===============================
 # 🛠 Helpers (Deterministic)
 # ===============================
+
+def extract_days(question: str, default=1):
+    match = re.search(r"(\d+)\s*(day|days)", question.lower())
+    if match:
+        return int(match.group(1))
+    return default
+
 
 def fetch_places_by_city(city: str):
     city = city.strip().lower()
@@ -104,6 +114,62 @@ def build_instruction_steps(text: str) -> List[InstructionStep]:
         )
     return steps
 
+# ===============================
+# ⏱ Visit Duration Estimator (minutes)
+# ===============================
+
+def estimate_visit_duration(place):
+    name = place["name"].lower()
+    desc = place.get("description", "").lower()
+
+    if "temple" in name or "temple" in desc:
+        return 60
+    if "beach" in name:
+        return 90
+    if "museum" in name:
+        return 120
+    if "park" in name:
+        return 75
+
+    return 60  # safe default
+
+
+# ===============================
+# 📅 Day-wise Planner (9:30 AM – 6:00 PM)
+# ===============================
+
+DAY_START_MIN = 9.5 * 60   # 9:30 AM
+DAY_END_MIN = 18 * 60     # 6:00 PM
+DAY_LIMIT = DAY_END_MIN - DAY_START_MIN  # 510 minutes
+
+
+def split_into_days(places):
+    days = []
+    current_day = []
+    time_used = 0
+
+    for i, place in enumerate(places):
+        visit_time = estimate_visit_duration(place)
+        travel_time = 0
+
+        if current_day:
+            prev = current_day[-1]
+            routes = get_transport(prev["place_id"], place["place_id"])
+            if routes:
+                travel_time = routes[0]["duration"]
+
+        if time_used + visit_time + travel_time > DAY_LIMIT:
+            days.append(current_day)
+            current_day = []
+            time_used = 0
+
+        current_day.append(place)
+        time_used += visit_time + travel_time
+
+    if current_day:
+        days.append(current_day)
+
+    return days
 
 
 # ===============================
@@ -144,15 +210,16 @@ def extract_json_only(text: str) -> str:
 SYSTEM_PROMPT = """
 You are an AI Trip Narrator.
 
-STRICT RULES:
-- You ONLY describe travel steps using the provided route facts
-- You MUST write plain text instructions (NOT JSON, NOT code)
-- Each instruction must be one clear sentence
-- Do NOT invent places, transport modes, costs, or durations
-- Do NOT add time slots unless explicitly present in the facts
-- Do NOT repeat places unnecessarily
+RULES:
+- You do NOT plan routes
+- You ONLY narrate provided route facts
+- Days start at 9:30 AM and end at 6:00 PM
+- Narrate day by day
+- One sentence per instruction
+- Do NOT invent places, time slots, or transport
 - If something is missing, say NOT_AVAILABLE
 """
+
 
 def ask_llm_for_instructions(context_json, question):
     response = ollama.chat(
@@ -172,9 +239,11 @@ User question:
 {question}
 
 TASK:
-Write step-by-step travel instructions.
-Each instruction MUST be on a new line.
-Use ONLY the route facts above.
+Narrate the trip DAY BY DAY using the route facts.
+Start each day with "Day X:".
+Then describe travel steps in order.
+Each instruction must be one sentence on a new line.
+
 """
             }
         ],
@@ -188,14 +257,22 @@ Use ONLY the route facts above.
 # ===============================
 
 def plan_trip(city: str, question: str) -> TripPlan:
+    title = f"Trip Plan for {city.title()}"
+    description = f"A personalized trip plan for {city.title()} based on your preferences."
     places = fetch_places_by_city(city)
     if not places:
         raise ValueError("No places found")
 
-    k = extract_k(question)
+    days = extract_days(question)
     people = extract_people(question)
 
+    MAX_SPOTS_PER_DAY = 4
+    k = days * MAX_SPOTS_PER_DAY
+
     top_places = select_top_k_places(places, k)
+    day_groups = split_into_days(top_places)
+
+
 
     tourist_spots: List[TouristSpot] = []
     transport_entries: List[Transport] = []
@@ -212,25 +289,28 @@ def plan_trip(city: str, question: str) -> TripPlan:
 
     route_facts = []
 
-    for i in range(len(top_places) - 1):
-        src = top_places[i]
-        dest = top_places[i + 1]
+    for day_index, day_places in enumerate(day_groups, start=1):
+        for i in range(len(day_places) - 1):
+            src = day_places[i]
+            dest = day_places[i + 1]
 
-        routes = get_transport(src["place_id"], dest["place_id"])
-        if not routes:
-            continue
+            routes = get_transport(src["place_id"], dest["place_id"])
+            if not routes:
+                continue
 
-        best = routes[0]
-        transport_entries.append(Transport(**best))
-        total_cost += best["average_cost"]
+            best = routes[0]
+            transport_entries.append(Transport(**best))
+            total_cost += best["average_cost"]
 
-        route_facts.append({
-            "from": src["name"],
-            "to": dest["name"],
-            "mode": best["name"],
-            "cost": best["average_cost"],
-            "duration": best["duration"]
-        })
+            route_facts.append({
+                "day": day_index,
+                "from": src["name"],
+                "to": dest["name"],
+                "mode": best["name"],
+                "cost": best["average_cost"],
+                "duration": best["duration"]
+            })
+
 
     # If no routes, skip LLM
     instructions = []
@@ -245,6 +325,9 @@ def plan_trip(city: str, question: str) -> TripPlan:
 
 
     return TripPlan(
+        title=title,
+        description=description,
+        people=people,
         tourist_spots=tourist_spots,
         transport=transport_entries,
         instructions=instructions,
