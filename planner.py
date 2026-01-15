@@ -4,6 +4,18 @@ from pydantic import BaseModel
 import json
 import ollama
 import re
+from pymongo import MongoClient
+
+# =============================
+# MongoDB Client Configuration
+# =============================
+
+client = MongoClient("mongodb://localhost:27017")
+db = client["tour_advisor"]
+
+places_col = db["places"]
+transport_col = db["transport_routes"]
+
 
 # ===============================
 # 📦 Models
@@ -20,8 +32,10 @@ class Transport(BaseModel):
     duration: Union[int, str]
 
 class InstructionStep(BaseModel):
-    step: int
-    instruction: str
+    day: int
+    time: str
+    place_name: str
+    location_link: str
 
 class CostSummary(BaseModel):
     total_cost_for_people: Union[int, str]
@@ -36,18 +50,6 @@ class TripPlan(BaseModel):
     cost_summary: CostSummary
     people: int
 
-
-# ===============================
-# 📂 Load Knowledge Base
-# ===============================
-
-with open("json_files/places.json", "r", encoding="utf-8") as f:
-    PLACES = json.load(f)["data"]
-
-with open("json_files/transport_distance.json", "r", encoding="utf-8") as f:
-    TRANSPORT_DATA = json.load(f)["data"]
-
-
 # ===============================
 # 🛠 Helpers (Deterministic)
 # ===============================
@@ -60,17 +62,13 @@ def extract_days(question: str, default=1):
 
 
 def fetch_places_by_city(city: str):
-    city = city.strip().lower()
-    return [
-        p for p in PLACES
-        if p.get("city", "").strip().lower() == city
-    ]
+    return list(
+        places_col.find(
+            {"city": {"$regex": f"^{city}$", "$options": "i"}},
+            {"_id": 0}
+        )
 
-def extract_k(question: str, default=3):
-    for w in question.split():
-        if w.isdigit():
-            return int(w)
-    return default
+    )
 
 def extract_people(question: str, default=4):
     match = re.search(
@@ -88,31 +86,64 @@ def select_top_k_places(places, k):
         reverse=True
     )[:k]
 
-def get_transport(src_id, dest_id):
-    routes = []
-    for entry in TRANSPORT_DATA:
-        if entry["src_place_id"] == src_id and entry["dest_place_id"] == dest_id:
-            for stop in entry.get("nearby_stops", []):
-                routes.append({
-                    "name": stop["mode"],
-                    "average_cost": stop["cost"],
-                    "duration": stop.get("duration", "NOT_AVAILABLE")
-                })
-    return sorted(routes, key=lambda x: x["average_cost"])
 
-def build_instruction_steps(text: str) -> List[InstructionStep]:
-    steps = []
-    for i, line in enumerate(text.split("\n"), start=1):
-        line = line.strip()
-        if not line:
-            continue
-        steps.append(
-            InstructionStep(
-                step=i,
-                instruction=line
-            )
+def get_transport(src_id, dest_id):
+    routes = list(
+        transport_col.find(
+            {
+                "src_place_id": src_id,
+                "dest_place_id": dest_id
+            },
+            {"_id": 0}
         )
-    return steps
+    )
+
+    return sorted(routes, key=lambda x: x["cost"])
+
+
+def minutes_to_time_str(minutes_from_midnight: int) -> str:
+    hours = minutes_from_midnight // 60
+    minutes = minutes_from_midnight % 60
+    suffix = "AM" if hours < 12 else "PM"
+    hours = hours if hours <= 12 else hours - 12
+    return f"{hours:02d}:{minutes:02d} {suffix}"
+
+
+def build_instruction_steps(day_groups) -> List[InstructionStep]:
+    instructions = []
+
+    for day_index, day_places in enumerate(day_groups, start=1):
+        current_time = int(DAY_START_MIN)  # 9:30 AM
+
+        for i, place in enumerate(day_places):
+            # Visit time
+            visit_duration = estimate_visit_duration(place)
+            visit_time_str = minutes_to_time_str(current_time)
+
+            instructions.append(
+                InstructionStep(
+                    day=day_index,
+                    time=visit_time_str,
+                    place_name=place["name"],
+                    location_link=place.get("google_maps_link", "NOT_AVAILABLE")
+                )
+            )
+
+            current_time += visit_duration
+
+            # Add travel time AFTER visit (if next place exists)
+            if i < len(day_places) - 1:
+                routes = get_transport(
+                    place["place_id"],
+                    day_places[i + 1]["place_id"]
+                )
+                if routes:
+                    travel_duration = routes[0].get("duration")
+                    if isinstance(travel_duration, int):
+                        current_time += travel_duration
+
+
+    return instructions
 
 # ===============================
 # ⏱ Visit Duration Estimator (minutes)
@@ -138,7 +169,7 @@ def estimate_visit_duration(place):
 # 📅 Day-wise Planner (9:30 AM – 6:00 PM)
 # ===============================
 
-DAY_START_MIN = 9.5 * 60   # 9:30 AM
+DAY_START_MIN = 9 * 60 + 30  # 570 (int)   # 9:30 AM
 DAY_END_MIN = 18 * 60     # 6:00 PM
 DAY_LIMIT = DAY_END_MIN - DAY_START_MIN  # 510 minutes
 
@@ -170,39 +201,6 @@ def split_into_days(places):
         days.append(current_day)
 
     return days
-
-
-# ===============================
-# 🧹 JSON Sanitizer
-# ===============================
-
-def extract_json_only(text: str) -> str:
-    # Find first JSON object
-    start = text.find("{")
-    if start == -1:
-        raise ValueError("No JSON start found")
-
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                raw = text[start:i + 1]
-                break
-    else:
-        raise ValueError("No complete JSON found")
-
-    # ---- Sanitize ----
-    raw = raw.replace(": NOT_AVAILABLE", ': "NOT_AVAILABLE"')
-    raw = raw.replace(": None", ': "NOT_AVAILABLE"')
-    raw = re.sub(r",\s*}", "}", raw)
-    raw = re.sub(r",\s*]", "]", raw)
-
-    return raw
-
-
 # ===============================
 # 🤖 LLM — Narration ONLY
 # ===============================
@@ -221,36 +219,59 @@ RULES:
 """
 
 
-def ask_llm_for_instructions(context_json, question):
+def ask_llm_to_plan(places, days, city, question):
+    """
+    LLM decides WHICH places to visit and in WHAT order.
+    It does NOT calculate time or cost.
+    """
+
+    place_summaries = [
+        {
+            "place_id": p["place_id"],
+            "name": p["name"],
+            "popularity": p.get("popularity", 0),
+            "category": p.get("category", "NOT_AVAILABLE")
+        }
+        for p in places
+    ]
+
     response = ollama.chat(
         model="mistral",
         messages=[
             {
                 "role": "system",
-                "content": SYSTEM_PROMPT
+                "content": """
+You are an AI Trip Planner.
+
+RULES:
+- Use ONLY the given places
+- Do NOT invent places
+- Choose places that best fit the trip duration
+- Output ONLY a JSON array of place_ids in visiting order
+- No explanations
+"""
             },
             {
                 "role": "user",
                 "content": f"""
-Route facts (DO NOT MODIFY):
-{context_json}
+City: {city}
+Days: {days}
 
-User question:
+Available places:
+{json.dumps(place_summaries, indent=2)}
+
+User request:
 {question}
 
-TASK:
-Narrate the trip DAY BY DAY using the route facts.
-Start each day with "Day X:".
-Then describe travel steps in order.
-Each instruction must be one sentence on a new line.
-
+Return JSON like:
+["PLACE_ID_1", "PLACE_ID_2", "..."]
 """
             }
         ],
-        options={"temperature": 0.2}
+        options={"temperature": 0.3}
     )
-    return response["message"]["content"]
 
+    return json.loads(response["message"]["content"])
 
 # ===============================
 # 🧠 Main Planner
@@ -259,6 +280,7 @@ Each instruction must be one sentence on a new line.
 def plan_trip(city: str, question: str) -> TripPlan:
     title = f"Trip Plan for {city.title()}"
     description = f"A personalized trip plan for {city.title()} based on your preferences."
+
     places = fetch_places_by_city(city)
     if not places:
         raise ValueError("No places found")
@@ -266,63 +288,59 @@ def plan_trip(city: str, question: str) -> TripPlan:
     days = extract_days(question)
     people = extract_people(question)
 
-    MAX_SPOTS_PER_DAY = 4
-    k = days * MAX_SPOTS_PER_DAY
+    # LLM decides order + selection
+    selected_place_ids = ask_llm_to_plan(
+        places=places,
+        days=days,
+        city=city,
+        question=question
+    )
 
-    top_places = select_top_k_places(places, k)
+    # Preserve original place objects
+    place_map = {p["place_id"]: p for p in places}
+
+    top_places = [
+        place_map[pid]
+        for pid in selected_place_ids
+        if pid in place_map
+    ]
+
     day_groups = split_into_days(top_places)
 
+    tourist_spots = [
+        TouristSpot(
+            name=p["name"],
+            popularity=p.get("popularity", "NOT_AVAILABLE"),
+            description=p.get("description", "NOT_AVAILABLE")
+        )
+        for p in top_places
+    ]
 
-
-    tourist_spots: List[TouristSpot] = []
-    transport_entries: List[Transport] = []
+    transport_entries = []
     total_cost = 0
 
-    for p in top_places:
-        tourist_spots.append(
-            TouristSpot(
-                name=p["name"],
-                popularity=p.get("popularity", "NOT_AVAILABLE"),
-                description=p.get("description", "NOT_AVAILABLE")
-            )
-        )
-
-    route_facts = []
-
-    for day_index, day_places in enumerate(day_groups, start=1):
+    for day_places in day_groups:
         for i in range(len(day_places) - 1):
-            src = day_places[i]
-            dest = day_places[i + 1]
-
-            routes = get_transport(src["place_id"], dest["place_id"])
+            routes = get_transport(
+                day_places[i]["place_id"],
+                day_places[i + 1]["place_id"]
+            )
             if not routes:
                 continue
 
             best = routes[0]
-            transport_entries.append(Transport(**best))
-            total_cost += best["average_cost"]
+            transport_entries.append(
+                Transport(
+                    name=best["mode"],
+                    average_cost=best["cost"],
+                    duration=best["duration"]
+                )
+            )
 
-            route_facts.append({
-                "day": day_index,
-                "from": src["name"],
-                "to": dest["name"],
-                "mode": best["name"],
-                "cost": best["average_cost"],
-                "duration": best["duration"]
-            })
+            total_cost += best["cost"]
 
 
-    # If no routes, skip LLM
-    instructions = []
-
-    if route_facts:
-        context = {"route_facts": route_facts}
-        llm_text = ask_llm_for_instructions(
-            json.dumps(context, indent=2),
-            question
-        )
-        instructions = build_instruction_steps(llm_text)
-
+    instructions = build_instruction_steps(day_groups)
 
     return TripPlan(
         title=title,
