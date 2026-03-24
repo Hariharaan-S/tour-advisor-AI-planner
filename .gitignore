@@ -2,3 +2,5 @@ __pycache__/
 json_files/
 myvenv/
 .env
+*_old_code.*
+*_api_key.*

@@ -1,356 +1,340 @@
-# planner.py
-from typing import List, Union
-from pydantic import BaseModel
+# ---------- IMPORTS ----------
 import json
-import ollama
-import re
-from pymongo import MongoClient
+from typing import TypedDict, Any, Dict, List, Optional
 
-# =============================
-# MongoDB Client Configuration
-# =============================
+from pydantic import BaseModel
+from langgraph.graph import StateGraph, END
 
-client = MongoClient("mongodb://localhost:27017")
-db = client["tour_advisor"]
+from langchain_qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Filter, FieldCondition, MatchValue, 
+    FormulaQuery, SumExpression, GaussDecayExpression, 
+    DecayParamsExpression, GeoDistance, GeoDistanceParams, GeoPoint,
+    Prefetch
+)
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_ollama import ChatOllama
 
-places_col = db["places"]
-transport_col = db["transport_routes"]
+from google_maps_tool import get_distance_matrix
 
+# ---------- LLM (QWEN) ----------
+llm = ChatOllama(
+    model="qwen2.5:7b",
+    base_url="http://localhost:11434",
+    temperature=0,
+    format="json"
+)
 
-# ===============================
-# 📦 Models
-# ===============================
+# ---------- QDRANT SETUP ----------
+embeddings = OllamaEmbeddings(model="nomic-embed-text")
+client = QdrantClient(url="http://localhost:6333")
 
-class TouristSpot(BaseModel):
-    name: str
-    popularity: Union[float, str]
-    description: str
+vectorstore = QdrantVectorStore(
+    client=client,
+    collection_name="tourism_places",
+    embedding=embeddings
+)
 
-class Transport(BaseModel):
-    name: str
-    average_cost: Union[int, str]
-    duration: Union[int, str]
-
-class InstructionStep(BaseModel):
-    day: int
-    time: str
-    place_name: str
-    location_link: str
-
-class CostSummary(BaseModel):
-    total_cost_for_people: Union[int, str]
-    people_count: int
-
+# ---------- MODELS ----------
 class TripPlan(BaseModel):
-    title: str
-    description: str
-    tourist_spots: List[TouristSpot]
-    transport: List[Transport]
-    instructions: List[InstructionStep]
-    cost_summary: CostSummary
+    title: str               
+    city: str
+    days: int
     people: int
+    budget: Optional[float] = None
+    plans: List[Dict[str, Any]]
 
-# ===============================
-# 🛠 Helpers (Deterministic)
-# ===============================
+class PlannerState(TypedDict, total=False):
+    city: str
+    days: int
+    people: int
+    coordinates: dict
+    budget: float
+    places: list
+    matrix: dict
+    routes: list
+    plans: list
+    iterations: int          
+    force_economy: bool      
+    error_message: str
 
-def extract_days(question: str, default=1):
-    match = re.search(r"(\d+)\s*(day|days)", question.lower())
-    if match:
-        return int(match.group(1))
-    return default
+# ---------- CONSTANTS & HELPERS ----------
+TRAVEL_FARE_CHART = {
+    "Cab": {"Low": 80, "Mid": 200, "High": 500},
+    "Bus": {"Low": 10, "Mid": 45, "High": 80},
+    "Train (MRTS)": {"Low": 5, "Mid": 10, "High": 20},
+    "Train (Metro)": {"Low": 10, "Mid": 30, "High": 50},
+    "Walk": {"Low": 0, "Mid": 0, "High": 0},
+}
 
+ACCESSIBILITY_ALIASES = {
+    "Car": "Cab", "Auto": "Cab", "Cab": "Cab",
+    "Bus": "Bus", "Train": "Train", "Walk": "Walk",
+}
 
-def fetch_places_by_city(city: str):
-    return list(
-        places_col.find(
-            {"city": {"$regex": f"^{city}$", "$options": "i"}},
-            {"_id": 0}
+def normalize_accessibility(modes):
+    if not isinstance(modes, list): return []
+    normalized = []
+    for mode in modes:
+        if not isinstance(mode, str): continue
+        m = mode.strip().title()
+        if m in ACCESSIBILITY_ALIASES: normalized.append(ACCESSIBILITY_ALIASES[m])
+    return list(set(normalized))
+
+def get_travel_cost(mode, distance_km):
+    band = "Low" if distance_km <= 5 else "Mid" if distance_km <= 15 else "High"
+    if mode == "Train":
+        variant = "Train (Metro)" if distance_km <= 10 else "Train (MRTS)"
+        return TRAVEL_FARE_CHART[variant][band], variant
+    return TRAVEL_FARE_CHART.get(mode, TRAVEL_FARE_CHART["Cab"])[band], mode
+
+def get_place_visit_cost(place):
+    return float(place.get("avg_cost_level", 0) or 0)
+
+def get_route_place_cost(route):
+    return round(sum(get_place_visit_cost(place) for place in route), 2)
+
+def get_leg_matrix_entry(matrix, origin_name, destination_name):
+    return matrix.get((origin_name, destination_name))
+
+def choose_travel_mode(origin, destination, distance_km, duration_min, force_economy=False):
+    origin_modes = set(origin.get("accessibility", []))
+    dest_modes = set(destination.get("accessibility", []))
+    shared = origin_modes.intersection(dest_modes)
+    priority = ("Train", "Bus", "Walk", "Cab") if force_economy else ("Cab", "Train", "Bus", "Walk")
+    chosen = next((m for m in priority if m in shared), "Cab")
+    cost, display_name = get_travel_cost(chosen, distance_km)
+    return {
+        "name": display_name,
+        "average_cost": cost,
+        "duration": round(duration_min, 2),
+        "distance_km": round(distance_km, 2),
+        "origin": origin["name"],
+        "destination": destination["name"]
+    }
+
+# ---------- NODES ----------
+
+def retrieve_places(state):
+    """QDRANT RAG: Fetches places based on City and optionally Geo-coordinates."""
+    city = state["city"].strip().lower()
+    k = min(state["days"] * 4, 15)
+    coords = state.get("coordinates")
+    city_filter = Filter(must=[FieldCondition(key="metadata.city", match=MatchValue(value=city))])
+
+    if coords and "lat" in coords and "lng" in coords:
+        results = client.query_points(
+            collection_name="tourism_places",
+            prefetch=[Prefetch(query=embeddings.embed_query(f"popular spots in {city}"), filter=city_filter, limit=40)],
+            query=FormulaQuery(formula=SumExpression(sum=[GaussDecayExpression(
+                gauss_decay=DecayParamsExpression(x=GeoDistance(geo_distance=GeoDistanceParams(
+                    origin=GeoPoint(lat=coords["lat"], lon=coords["lng"]), to="metadata.location")), scale=5000))])),
+            limit=k, with_payload=True
         )
+    else:
+        results = client.query_points(collection_name="tourism_places", query=embeddings.embed_query(f"tourist attractions in {city}"), 
+                                      query_filter=city_filter, limit=k, with_payload=True)
 
-    )
+    places = []
+    for p in results.points:
+        metadata = getattr(p, 'payload', {}).get('metadata', {}) if hasattr(p, 'payload') else {}
+        name = metadata.get("place") or getattr(p, 'payload', {}).get('place') or "Unknown Place"
+        places.append({
+            "name": name,
+            "avg_cost_level": metadata.get("avg_cost_level", 0),
+            "popularity": metadata.get("popularity", 5),
+            "description": getattr(p, 'payload', {}).get("page_content", "A famous attraction."),
+            "accessibility": normalize_accessibility(metadata.get("accessibility", []))
+        })
 
-def extract_people(question: str, default=4):
-    match = re.search(
-        r"(for|of)\s+(\d+)\s+(people|persons|members)",
-        question.lower()
-    )
-    if match:
-        return int(match.group(2))
-    return default
+    state["places"] = places
+    return state
 
-def select_top_k_places(places, k):
-    return sorted(
-        places,
-        key=lambda x: x.get("popularity", 0),
-        reverse=True
-    )[:k]
-
-
-def get_transport(src_id, dest_id):
-    routes = list(
-        transport_col.find(
-            {
-                "src_place_id": src_id,
-                "dest_place_id": dest_id
-            },
-            {"_id": 0}
-        )
-    )
-
-    return sorted(routes, key=lambda x: x["cost"])
-
-
-def minutes_to_time_str(minutes_from_midnight: int) -> str:
-    hours = minutes_from_midnight // 60
-    minutes = minutes_from_midnight % 60
-    suffix = "AM" if hours < 12 else "PM"
-    hours = hours if hours <= 12 else hours - 12
-    return f"{hours:02d}:{minutes:02d} {suffix}"
-
-
-def build_instruction_steps(day_groups) -> List[InstructionStep]:
-    instructions = []
-
-    for day_index, day_places in enumerate(day_groups, start=1):
-        current_time = int(DAY_START_MIN)  # 9:30 AM
-
-        for i, place in enumerate(day_places):
-            # Visit time
-            visit_duration = estimate_visit_duration(place)
-            visit_time_str = minutes_to_time_str(current_time)
-
-            instructions.append(
-                InstructionStep(
-                    day=day_index,
-                    time=visit_time_str,
-                    place_name=place["name"],
-                    location_link=place.get("google_maps_link", "NOT_AVAILABLE")
-                )
-            )
-
-            current_time += visit_duration
-
-            # Add travel time AFTER visit (if next place exists)
-            if i < len(day_places) - 1:
-                routes = get_transport(
-                    place["place_id"],
-                    day_places[i + 1]["place_id"]
-                )
-                if routes:
-                    travel_duration = routes[0].get("duration")
-                    if isinstance(travel_duration, int):
-                        current_time += travel_duration
-
-
-    return instructions
-
-# ===============================
-# ⏱ Visit Duration Estimator (minutes)
-# ===============================
-
-def estimate_visit_duration(place):
-    name = place["name"].lower()
-    desc = place.get("description", "").lower()
-
-    if "temple" in name or "temple" in desc:
-        return 60
-    if "beach" in name:
-        return 90
-    if "museum" in name:
-        return 120
-    if "park" in name:
-        return 75
-
-    return 60  # safe default
-
-
-# ===============================
-# 📅 Day-wise Planner (9:30 AM – 6:00 PM)
-# ===============================
-
-DAY_START_MIN = 9 * 60 + 30  # 570 (int)   # 9:30 AM
-DAY_END_MIN = 18 * 60     # 6:00 PM
-DAY_LIMIT = DAY_END_MIN - DAY_START_MIN  # 510 minutes
-
-
-def split_into_days(places):
-    days = []
-    current_day = []
-    time_used = 0
-
-    for i, place in enumerate(places):
-        visit_time = estimate_visit_duration(place)
-        travel_time = 0
-
-        if current_day:
-            prev = current_day[-1]
-            routes = get_transport(prev["place_id"], place["place_id"])
-            if routes:
-                travel_time = routes[0]["duration"]
-
-        if time_used + visit_time + travel_time > DAY_LIMIT:
-            days.append(current_day)
-            current_day = []
-            time_used = 0
-
-        current_day.append(place)
-        time_used += visit_time + travel_time
-
-    if current_day:
-        days.append(current_day)
-
-    return days
-# ===============================
-# 🤖 LLM — Narration ONLY
-# ===============================
-
-SYSTEM_PROMPT = """
-You are an AI Trip Narrator.
-
-RULES:
-- You do NOT plan routes
-- You ONLY narrate provided route facts
-- Days start at 9:30 AM and end at 6:00 PM
-- Narrate day by day
-- One sentence per instruction
-- Do NOT invent places, time slots, or transport
-- If something is missing, say NOT_AVAILABLE
-"""
-
-
-def ask_llm_to_plan(places, days, city, question):
-    """
-    LLM decides WHICH places to visit and in WHAT order.
-    It does NOT calculate time or cost.
-    """
-
-    place_summaries = [
-        {
-            "place_id": p["place_id"],
-            "name": p["name"],
-            "popularity": p.get("popularity", 0),
-            "category": p.get("category", "NOT_AVAILABLE")
-        }
-        for p in places
-    ]
-
-    response = ollama.chat(
-        model="mistral",
-        messages=[
-            {
-                "role": "system",
-                "content": """
-You are an AI Trip Planner.
-
-RULES:
-- Use ONLY the given places
-- Do NOT invent places
-- Choose places that best fit the trip duration
-- Output ONLY a JSON array of place_ids in visiting order
-- No explanations
-"""
-            },
-            {
-                "role": "user",
-                "content": f"""
-City: {city}
-Days: {days}
-
-Available places:
-{json.dumps(place_summaries, indent=2)}
-
-User request:
-{question}
-
-Return JSON like:
-["PLACE_ID_1", "PLACE_ID_2", "..."]
-"""
-            }
-        ],
-        options={"temperature": 0.3}
-    )
-
-    return json.loads(response["message"]["content"])
-
-# ===============================
-# 🧠 Main Planner
-# ===============================
-
-def plan_trip(city: str, question: str) -> TripPlan:
-    title = f"Trip Plan for {city.title()}"
-    description = f"A personalized trip plan for {city.title()} based on your preferences."
-
-    places = fetch_places_by_city(city)
+def compute_matrix(state: PlannerState):
+    places = state.get("places", []) or []
     if not places:
-        raise ValueError("No places found")
+        state["matrix"] = {}
+        return state
 
-    days = extract_days(question)
-    people = extract_people(question)
+    try:
+        state["matrix"] = get_distance_matrix(places, state.get("city"))
+    except Exception as e:
+        state["matrix"] = {}
 
-    # LLM decides order + selection
-    selected_place_ids = ask_llm_to_plan(
-        places=places,
-        days=days,
-        city=city,
-        question=question
-    )
+    return state
 
-    # Preserve original place objects
-    place_map = {p["place_id"]: p for p in places}
+def generate_routes(state: PlannerState):
+    """QWEN LLM: Sequences the spots into intelligent versions."""
+    places = state.get("places", []) or []
+    # Fallback pure deterministic path if no places or LLM fails.
+    if not places:
+        state["routes"] = []
+        return state
 
-    top_places = [
-        place_map[pid]
-        for pid in selected_place_ids
-        if pid in place_map
-    ]
+    names = [p.get("name", "") for p in places]
+    prompt = f"As a travel expert for {state.get('city','unknown')}, create 2 routes from these spots: {names}. Version 1: Famous, Version 2: Efficient. Return ONLY JSON: {{\"version1\": [names], \"version2\": [names]}}"
 
-    day_groups = split_into_days(top_places)
+    place_lookup = {p.get("name", ""): p for p in places}
+    routes = []
 
-    tourist_spots = [
-        TouristSpot(
-            name=p["name"],
-            popularity=p.get("popularity", "NOT_AVAILABLE"),
-            description=p.get("description", "NOT_AVAILABLE")
-        )
-        for p in top_places
-    ]
+    try:
+        response = llm.invoke(prompt)
+        data = json.loads(response.content)
 
-    transport_entries = []
-    total_cost = 0
+        if isinstance(data, dict):
+            for k in ["version1", "version2"]:
+                if k in data and isinstance(data[k], list):
+                    route_items = [place_lookup[n] for n in data[k] if n in place_lookup]
+                    if route_items:
+                        routes.append({"route": route_items})
 
-    for day_places in day_groups:
-        for i in range(len(day_places) - 1):
-            routes = get_transport(
-                day_places[i]["place_id"],
-                day_places[i + 1]["place_id"]
-            )
-            if not routes:
-                continue
+    except Exception as e:
+        print("generate_routes: LLM or parsing error:", e)
 
-            best = routes[0]
-            transport_entries.append(
-                Transport(
-                    name=best["mode"],
-                    average_cost=best["cost"],
-                    duration=best["duration"]
-                )
-            )
+    if not routes:
+        # fallback ranking: popularity descending and simple reverse
+        forward = sorted(places, key=lambda p: p.get("popularity", 0), reverse=True)
+        reverse = list(reversed(forward))
+        routes.append({"route": forward})
+        if reverse != forward:
+            routes.append({"route": reverse})
 
-            total_cost += best["cost"]
+    state["routes"] = routes
+    return state
 
+def generate_itinerary(state: PlannerState):
+    """QWEN + LOGIC: Calculates costs and generates timed instructions."""
+    routes = state.get("routes", []) or []
+    people = state.get("people", 1)
+    matrix = state.get("matrix", {})
+    budget = state.get("budget")
+    force_econ = state.get("force_economy", False)
 
-    instructions = build_instruction_steps(day_groups)
+    plans = []
 
-    return TripPlan(
-        title=title,
-        description=description,
-        people=people,
-        tourist_spots=tourist_spots,
-        transport=transport_entries,
-        instructions=instructions,
-        cost_summary=CostSummary(
-            total_cost_for_people=total_cost * people,
-            people_count=people
-        )
-    )
+    if not routes:
+        state["plans"] = []
+        return state
+
+    for idx, r in enumerate(routes):
+        route = r.get("route", []) or []
+        if not route:
+            continue
+
+        tourist_spots, transport = [], []
+        total_travel_cost = 0
+        total_place_cost = get_route_place_cost(route)
+
+        for i, place in enumerate(route):
+            tourist_spots.append({
+                "name": place.get("name", ""),
+                "popularity": place.get("popularity", 0),
+                "description": place.get("description", "")
+            })
+            if i < len(route) - 1:
+                d = get_leg_matrix_entry(matrix, place.get("name"), route[i+1].get("name")) or \
+                    get_leg_matrix_entry(matrix, f"{place.get('name', '')}, {state.get('city','')} ", f"{route[i+1].get('name','')}, {state.get('city','')} ")
+                if d:
+                    leg = choose_travel_mode(place, route[i+1], d.get("distance_km", 0), d.get("duration_min", 0), force_economy=force_econ)
+                    transport.append(leg)
+                    total_travel_cost += leg.get("average_cost", 0)
+
+        # QWEN GENERATES INSTRUCTIONS
+        prompt = f"Generate a timed day-by-day itinerary for: {[p.get('name','') for p in route]}. Include Day, Time, and Description. Return ONLY JSON: {{\"instructions\": [{{\"day\": 1, \"time\": \"9:00 AM\", \"place_name\": \"...\", \"description\": \"...\"}}]}}"
+
+        instructions = []
+        try:
+            llm_res = llm.invoke(prompt)
+            instructions = json.loads(llm_res.content).get("instructions", [])
+        except Exception as e:
+            print("generate_itinerary: LLM instructions error:", e)
+            instructions = [{"day": 1, "time": f"{9+i}:00 AM", "place_name": p.get("name", "")} for i, p in enumerate(route)]
+
+        plans.append({
+            "title": f"Trip to {state.get('city','').title()} - Route {idx+1}",
+            "description": f"Optimized {'Economy' if force_econ else 'Standard'} itinerary",
+            "tourist_spots": tourist_spots,
+            "transport": transport,
+            "instructions": instructions,
+            "cost_summary": {"total_cost_for_people": round((total_place_cost + total_travel_cost) * people, 2), "people_count": people},
+            "people": people
+        })
+
+    if budget is not None:
+        plans = [p for p in plans if p.get("cost_summary", {}).get("total_cost_for_people", float('inf')) <= budget]
+
+    state["plans"] = plans
+    return state
+
+# ---------- AGENT CONTROL ----------
+def budget_evaluator(state: PlannerState):
+    budget = state.get("budget")
+    plans = state.get("plans", []) or []
+
+    if not budget:
+        return "success"
+
+    valid_plans = [p for p in plans if p.get("cost_summary", {}).get("total_cost_for_people", float('inf')) <= budget]
+    if valid_plans:
+        state["plans"] = valid_plans
+        return "success"
+
+    if state.get("iterations", 0) < 1:
+        return "optimize"
+
+    state["error_message"] = f"No itinerary fits the provided budget ({budget})."
+    return "fail"
+
+def optimize_for_budget(state: PlannerState):
+    state["force_economy"] = True
+    state["iterations"] = state.get("iterations", 0) + 1
+    state["places"] = sorted(state["places"], key=lambda x: x.get("avg_cost_level", 0))[:8]
+    return state
+
+# ---------- GRAPH ----------
+builder = StateGraph(PlannerState)
+builder.add_node("retrieve_places", retrieve_places)
+builder.add_node("compute_matrix", compute_matrix)
+builder.add_node("generate_routes", generate_routes)
+builder.add_node("generate_itinerary", generate_itinerary)
+builder.add_node("optimize_for_budget", optimize_for_budget)
+
+builder.set_entry_point("retrieve_places")
+builder.add_edge("retrieve_places", "compute_matrix")
+builder.add_edge("compute_matrix", "generate_routes")
+builder.add_edge("generate_routes", "generate_itinerary")
+builder.add_conditional_edges("generate_itinerary", budget_evaluator, {"success": END, "optimize": "optimize_for_budget", "fail": END})
+builder.add_edge("optimize_for_budget", "compute_matrix")
+
+graph = builder.compile()
+
+# ---------- FINAL WRAPPER ----------
+def plan_trip(cityName: str, numberOfDays: int = 4, budget: Optional[float] = None, people: int = 4, coordinates: Optional[dict] = None) -> Dict[str, Any]:
+    if not cityName or not isinstance(cityName, str) or not cityName.strip():
+        raise ValueError("cityName is required")
+
+    input_state = {
+        "city": cityName.strip(),
+        "days": max(int(numberOfDays), 1),
+        "people": max(int(people), 1),
+        "coordinates": coordinates,
+        "budget": budget,
+        "iterations": 0,
+        "force_economy": False,
+        "places": [],
+        "routes": [],
+        "matrix": {}
+    }
+
+    result = graph.invoke(input_state)
+
+    return {
+        "title": f"Trip to {cityName.title()} for {numberOfDays} Days",
+        "city": cityName,
+        "days": numberOfDays,
+        "people": people,
+        "budget": budget,
+        "plans": result.get("plans", []),
+        "error_message": result.get("error_message")
+    }
