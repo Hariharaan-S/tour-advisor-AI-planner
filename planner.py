@@ -1,5 +1,6 @@
 # ---------- IMPORTS ----------
 import json
+import math
 from typing import TypedDict, Any, Dict, List, Optional
 
 from pydantic import BaseModel
@@ -52,6 +53,7 @@ class PlannerState(TypedDict, total=False):
     coordinates: dict
     budget: float
     places: list
+    transport: list
     matrix: dict
     routes: list
     plans: list
@@ -95,8 +97,104 @@ def get_place_visit_cost(place):
 def get_route_place_cost(route):
     return round(sum(get_place_visit_cost(place) for place in route), 2)
 
-def get_leg_matrix_entry(matrix, origin_name, destination_name):
-    return matrix.get((origin_name, destination_name))
+def get_leg_matrix_entry(matrix, origin_name, destination_name, city=None):
+    if not matrix or not origin_name or not destination_name:
+        return None
+
+    origin_name = origin_name.strip() if isinstance(origin_name, str) else ""
+    destination_name = destination_name.strip() if isinstance(destination_name, str) else ""
+    if not origin_name or not destination_name:
+        return None
+
+    origin_variants = [origin_name]
+    destination_variants = [destination_name]
+    if city and isinstance(city, str):
+        city = city.strip()
+        if city and city.lower() not in origin_name.lower():
+            origin_variants.append(f"{origin_name}, {city}")
+        if city and city.lower() not in destination_name.lower():
+            destination_variants.append(f"{destination_name}, {city}")
+
+    for origin_variant in origin_variants:
+        for destination_variant in destination_variants:
+            entry = matrix.get((origin_variant, destination_variant))
+            if entry is not None:
+                return entry
+    return None
+
+def _is_valid_coordinate_pair(coords):
+    return (
+        isinstance(coords, dict)
+        and isinstance(coords.get("lat"), (int, float))
+        and isinstance(coords.get("lng"), (int, float))
+    )
+
+def _haversine_distance_km(origin, destination):
+    """Returns great-circle distance between two lat/lng points."""
+    lat1 = math.radians(origin["lat"])
+    lon1 = math.radians(origin["lng"])
+    lat2 = math.radians(destination["lat"])
+    lon2 = math.radians(destination["lng"])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return 6371 * (2 * math.asin(math.sqrt(a)))
+
+def _order_route_from_closest_start(route, coordinates):
+    """Keeps route intent, but ensures the first stop is the nearest place to the user."""
+    if not route or not _is_valid_coordinate_pair(coordinates):
+        return route
+
+    ranked = []
+    for idx, place in enumerate(route):
+        place_coords = place.get("location")
+        if _is_valid_coordinate_pair(place_coords):
+            ranked.append((_haversine_distance_km(coordinates, place_coords), idx, place))
+
+    if not ranked:
+        return route
+
+    _, nearest_idx, _ = min(ranked, key=lambda item: item[:2])
+    if nearest_idx == 0:
+        return route
+
+    return [route[nearest_idx], *route[:nearest_idx], *route[nearest_idx + 1:]]
+
+def _sort_places_by_distance(places, coordinates):
+    if not places:
+        return []
+
+    if not _is_valid_coordinate_pair(coordinates):
+        return sorted(places, key=lambda p: p.get("popularity", 0), reverse=True)
+
+    def sort_key(place):
+        place_coords = place.get("location")
+        if _is_valid_coordinate_pair(place_coords):
+            return (_haversine_distance_km(coordinates, place_coords), -place.get("popularity", 0), place.get("name", ""))
+        return (float("inf"), -place.get("popularity", 0), place.get("name", ""))
+
+    return sorted(places, key=sort_key)
+
+def _filter_places_by_budget(places, budget, people):
+    """Filters places so cumulative visit cost stays within budget before routing."""
+    if budget is None or budget <= 0 or not places:
+        return places
+
+    per_person_budget = float(budget) / max(int(people or 1), 1)
+    running_total = 0.0
+    filtered = []
+
+    for place in sorted(places, key=lambda p: (get_place_visit_cost(p), -p.get("popularity", 0), p.get("name", ""))):
+        place_cost = get_place_visit_cost(place)
+        if filtered and running_total + place_cost > per_person_budget:
+            continue
+        if not filtered and place_cost > per_person_budget:
+            continue
+        filtered.append(place)
+        running_total += place_cost
+
+    return filtered
 
 def choose_travel_mode(origin, destination, distance_km, duration_min, force_economy=False):
     origin_modes = set(origin.get("accessibility", []))
@@ -145,7 +243,8 @@ def retrieve_places(state):
             "avg_cost_level": metadata.get("avg_cost_level", 0),
             "popularity": metadata.get("popularity", 5),
             "description": getattr(p, 'payload', {}).get("page_content", "A famous attraction."),
-            "accessibility": normalize_accessibility(metadata.get("accessibility", []))
+            "accessibility": normalize_accessibility(metadata.get("accessibility", [])),
+            "location": metadata.get("location")
         })
 
     state["places"] = places
@@ -165,40 +264,23 @@ def compute_matrix(state: PlannerState):
     return state
 
 def generate_routes(state: PlannerState):
-    """QWEN LLM: Sequences the spots into intelligent versions."""
+    """Creates deterministic routes after budget filtering and distance sorting."""
     places = state.get("places", []) or []
-    # Fallback pure deterministic path if no places or LLM fails.
+    coordinates = state.get("coordinates", {}) or {}
+    budget = state.get("budget")
+    people = state.get("people", 1)
+
     if not places:
         state["routes"] = []
         return state
 
-    names = [p.get("name", "") for p in places]
-    prompt = f"As a travel expert for {state.get('city','unknown')}, create 2 routes from these spots: {names}. Version 1: Famous, Version 2: Efficient. Return ONLY JSON: {{\"version1\": [names], \"version2\": [names]}}"
+    filtered_places = _filter_places_by_budget(places, budget, people)
+    if not filtered_places:
+        state["routes"] = []
+        return state
 
-    place_lookup = {p.get("name", ""): p for p in places}
-    routes = []
-
-    try:
-        response = llm.invoke(prompt)
-        data = json.loads(response.content)
-
-        if isinstance(data, dict):
-            for k in ["version1", "version2"]:
-                if k in data and isinstance(data[k], list):
-                    route_items = [place_lookup[n] for n in data[k] if n in place_lookup]
-                    if route_items:
-                        routes.append({"route": route_items})
-
-    except Exception as e:
-        print("generate_routes: LLM or parsing error:", e)
-
-    if not routes:
-        # fallback ranking: popularity descending and simple reverse
-        forward = sorted(places, key=lambda p: p.get("popularity", 0), reverse=True)
-        reverse = list(reversed(forward))
-        routes.append({"route": forward})
-        if reverse != forward:
-            routes.append({"route": reverse})
+    primary_route = _sort_places_by_distance(filtered_places, coordinates)
+    routes = [{"route": _order_route_from_closest_start(primary_route, coordinates)}]
 
     state["routes"] = routes
     return state
@@ -233,23 +315,114 @@ def generate_itinerary(state: PlannerState):
                 "description": place.get("description", "")
             })
             if i < len(route) - 1:
-                d = get_leg_matrix_entry(matrix, place.get("name"), route[i+1].get("name")) or \
-                    get_leg_matrix_entry(matrix, f"{place.get('name', '')}, {state.get('city','')} ", f"{route[i+1].get('name','')}, {state.get('city','')} ")
-                if d:
-                    leg = choose_travel_mode(place, route[i+1], d.get("distance_km", 0), d.get("duration_min", 0), force_economy=force_econ)
-                    transport.append(leg)
-                    total_travel_cost += leg.get("average_cost", 0)
+                d = get_leg_matrix_entry(
+                    matrix,
+                    place.get("name"),
+                    route[i+1].get("name"),
+                    city=state.get("city")
+                )
+
+                if d is None:
+                    origin_loc = place.get("location")
+                    destination_loc = route[i+1].get("location")
+                    if _is_valid_coordinate_pair(origin_loc) and _is_valid_coordinate_pair(destination_loc):
+                        distance_km = _haversine_distance_km(origin_loc, destination_loc)
+                        duration_min = max(10, distance_km / 40 * 60)
+                        d = {"distance_km": round(distance_km, 2), "duration_min": round(duration_min, 2)}
+                    else:
+                        d = {"distance_km": 3.0, "duration_min": 18.0}
+
+                leg = choose_travel_mode(
+                    place,
+                    route[i+1],
+                    d.get("distance_km", 0),
+                    d.get("duration_min", 0),
+                    force_economy=force_econ
+                )
+                transport.append(leg)
+                total_travel_cost += leg.get("average_cost", 0)
 
         # QWEN GENERATES INSTRUCTIONS
-        prompt = f"Generate a timed day-by-day itinerary for: {[p.get('name','') for p in route]}. Include Day, Time, and Description. Return ONLY JSON: {{\"instructions\": [{{\"day\": 1, \"time\": \"9:00 AM\", \"place_name\": \"...\", \"description\": \"...\"}}]}}"
+
+        prompt = f"""
+You are an expert trip planner and travel guide.
+
+Your task is to generate an efficient, budget-aware itinerary that covers ALL the given places.
+
+Places:
+{[p.get('name','') for p in route]}
+Trasport Options:
+{[f"{t.get('origin')} to {t.get('destination')} by {t.get('name')} (₹{t.get('average_cost', 0)}, {t.get('duration', 0)} mins)" for t in transport]}
+
+Requirements:
+- Plan the trip day-by-day with proper timing
+- Optimize route for minimum travel time and cost
+- Include transport mode (bus/train/auto/walk etc.)
+- Mention approximate travel cost for each step
+- Ensure instructions are clear and sequential
+- Cover ALL places without skipping
+- Keep plan realistic (morning to evening schedule)
+
+Output MUST include:
+1. tourist_spots → list of place names
+2. instructions → step-by-step travel plan
+
+Instruction format example:
+1. First take a bus to PLACE_1 which costs ₹X at HH:MM AM/PM
+2. Spend time at PLACE_1, then take a TRANSPORT_MODE to PLACE_2 costing ₹Y at HH:MM AM/PM
+
+Return ONLY valid JSON. No explanation.
+
+Format:
+{{
+  "tourist_spots": [
+    "PLACE_1",
+    "PLACE_2"
+  ],
+  "instructions": [
+    {{
+      "day": 1,
+      "time": "09:00 AM",
+      "place_name": "PLACE_1",
+      "description": "First take a bus to PLACE_1 which costs ₹X at 09:00 AM. Spend time there and then take another transport to next place."
+    }}
+  ]
+}}
+"""
 
         instructions = []
         try:
             llm_res = llm.invoke(prompt)
             instructions = json.loads(llm_res.content).get("instructions", [])
+            if not isinstance(instructions, list):
+                raise ValueError("Invalid instructions structure")
         except Exception as e:
             print("generate_itinerary: LLM instructions error:", e)
-            instructions = [{"day": 1, "time": f"{9+i}:00 AM", "place_name": p.get("name", "")} for i, p in enumerate(route)]
+            instructions = []
+
+        normalized_instructions = []
+        for i, p in enumerate(route):
+            item = instructions[i] if i < len(instructions) and isinstance(instructions[i], dict) else {}
+            time_label = item.get("time") or f"{9 + i}:00 AM"
+            place_name = item.get("place_name") or p.get("name", "")
+            description = item.get("description") or p.get("description", "Visit this place and enjoy your time there.")
+
+            if not item.get("description") and i < len(transport):
+                leg = transport[i]
+                description = (
+                    f"Take {leg.get('name')} from {leg.get('origin')} to {leg.get('destination')}"
+                    f" costing ₹{leg.get('average_cost', 0)} and arriving around {time_label}. "
+                    f"Then spend time at {leg.get('destination')}."
+                )
+
+            normalized_instructions.append({
+                "day": item.get("day", 1),
+                "time": time_label,
+                "place_name": place_name,
+                "description": description
+            })
+
+        instructions = normalized_instructions
 
         plans.append({
             "title": f"Trip to {state.get('city','').title()} - Route {idx+1}",
