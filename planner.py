@@ -1,6 +1,9 @@
 # ---------- IMPORTS ----------
+from datetime import datetime
 import json
 import math
+import redis
+import hashlib
 from typing import TypedDict, Any, Dict, List, Optional
 
 from pydantic import BaseModel
@@ -18,6 +21,151 @@ from langchain_community.embeddings import OllamaEmbeddings
 from langchain_ollama import ChatOllama
 
 from google_maps_tool import get_distance_matrix
+from datetime import datetime, timedelta
+
+
+#------------------- Deterministic Time Engine -------------------------
+
+def compute_itinerary_schedule(route, transport, start_time="09:00 AM"):
+    """
+    Deterministically computes arrival + departure times
+    using opening hours from VISITING_TIMES.
+    """
+
+    def parse_time(t):
+        if not isinstance(t, str):
+            return None
+        normalized = t.strip().replace(".", ":").upper()
+        normalized = normalized.replace("NOON", "PM").replace("MIDNIGHT", "AM")
+        if normalized == "0":
+            return None
+        if normalized in {"00:00", "00:00 AM", "00:00 PM"}:
+            return datetime.strptime("12:00 AM", "%I:%M %p")
+        try:
+            return datetime.strptime(normalized, "%I:%M %p")
+        except ValueError:
+            try:
+                return datetime.strptime(normalized, "%I:%M%p")
+            except ValueError:
+                return None
+
+    def format_time(t):
+        return t.strftime("%I:%M %p")
+
+    def get_open_windows(place_name):
+        if not isinstance(place_name, str):
+            return []
+
+        normalized = place_name.lower()
+        place_key = None
+        for candidate in VISITING_TIMES.keys():
+            if candidate in normalized:
+                place_key = candidate
+                break
+
+        if place_key is None:
+            return []
+
+        windows = []
+        schedule = VISITING_TIMES.get(place_key, {})
+        for period in ("morning", "evening"):
+            period_data = schedule.get(period, {})
+            open_time = _clean_time_label(period_data.get("open"))
+            close_time = _clean_time_label(period_data.get("close"))
+            start = parse_time(open_time)
+            end = parse_time(close_time)
+            if start and end:
+                windows.append((start, end))
+
+        return windows
+
+    def align_to_open_window(current_time, windows):
+        if not windows:
+            return current_time
+
+        day_base = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        actual_windows = []
+        for start, end in windows:
+            actual_start = day_base + timedelta(hours=start.hour, minutes=start.minute)
+            actual_end = day_base + timedelta(hours=end.hour, minutes=end.minute)
+
+            # If a window crosses midnight, advance its end into the next day.
+            if actual_end <= actual_start:
+                actual_end += timedelta(days=1)
+
+            actual_windows.append((actual_start, actual_end))
+
+        actual_windows.sort(key=lambda w: w[0])
+
+        for start, end in actual_windows:
+            if current_time <= start:
+                return start
+            if start <= current_time < end:
+                return current_time
+
+        # already past all windows today, move to next day's first window
+        first_start = actual_windows[0][0] + timedelta(days=1)
+        return first_start
+
+    current_time = parse_time(start_time)
+    if current_time is None:
+        current_time = datetime.strptime("09:00 AM", "%I:%M %p")
+
+    instructions = []
+
+    for i, place in enumerate(route):
+        place_name = place.get("name", "")
+
+        if i > 0:
+            leg = transport[i-1]
+            travel_min = leg.get("duration", 0)
+            current_time += timedelta(minutes=travel_min)
+
+        arrival_time = current_time
+        open_windows = get_open_windows(place_name)
+        arrival_time = align_to_open_window(arrival_time, open_windows)
+
+        visit_min = place.get("visit_duration_minutes", 60)
+        departure_time = arrival_time + timedelta(minutes=visit_min)
+        current_time = departure_time
+
+        instructions.append({
+            "day": arrival_time.day,
+            "time": format_time(arrival_time),
+            "place_name": place_name,
+            "arrival_time": format_time(arrival_time),
+            "departure_time": format_time(departure_time),
+            "visit_duration": visit_min
+        })
+
+    return instructions
+
+
+#-------------- Redis Client Connection --------------
+r = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+
+#-------------- Redis Helper Functions --------------
+def generate_cache_key(places, city):
+    # handle both dict and string inputs
+    place_names = [
+        p["name"] if isinstance(p, dict) else p
+        for p in places
+    ]
+
+    key_string = f"{city}:{','.join(sorted(place_names))}"
+    return "distance_matrix:" + hashlib.md5(key_string.encode()).hexdigest()
+
+def serialize_matrix(data):
+    return {
+        f"{k[0]}||{k[1]}": v   # convert tuple → string
+        for k, v in data.items()
+    }
+
+def deserialize_matrix(data):
+    return {
+        tuple(k.split("||")): v
+        for k, v in data.items()
+    }
 
 # ---------- LLM (QWEN) ----------
 llm = ChatOllama(
@@ -53,6 +201,7 @@ class PlannerState(TypedDict, total=False):
     coordinates: dict
     budget: float
     places: list
+    visiting_time: dict
     transport: list
     matrix: dict
     routes: list
@@ -75,6 +224,111 @@ ACCESSIBILITY_ALIASES = {
     "Bus": "Bus", "Train": "Train", "Walk": "Walk",
 }
 
+#---------------- Average opening and closing time of places -----------------------------
+VISITING_TIMES = {
+    "beach": {
+        "morning": {
+            "open": "0",
+            "close": "0"
+        },
+        "evening": {
+            "open": "0",
+            "close": "0"
+        }
+    },
+    "temple": {
+        "morning": {
+            "open": "06:00 AM",
+            "close": "12.00 NOON"
+        },
+        "evening": {
+            "open":"04:30 PM",
+            "close":"09.00 PM"
+        }
+    },
+    "amusement park": {
+        "morning": {
+            "open": "09.30 AM",
+            "close": "00:00"
+        },
+        "evening": {
+            "open": "00:00",
+            "close": "06:30 PM"
+        }
+    },
+    "park": {
+        "morning": {
+            "open": "09.30 AM",
+            "close": "00:00"
+        },
+        "evening": {
+            "open": "00:00",
+            "close": "06:30 PM"
+        }
+    }
+}
+
+
+def _clean_time_label(value):
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or value in {"0", "00.0", "00.00"}:
+        return None
+    return value
+
+
+def get_visit_profile(place_name, visiting_time=VISITING_TIMES):
+    place_key = None
+    if isinstance(place_name, str):
+        normalized = place_name.lower()
+        for candidate in visiting_time.keys():
+            if candidate in normalized:
+                place_key = candidate
+                break
+
+    if place_key is None:
+        return {
+            "type": "general",
+            "duration_min": 60,
+            "opening_hours": ["Flexible timing"]
+        }
+
+    schedule = visiting_time.get(place_key, {})
+    hours = []
+    morning = schedule.get("morning", {})
+    evening = schedule.get("evening", {})
+
+    morning_open = _clean_time_label(morning.get("open"))
+    morning_close = _clean_time_label(morning.get("close"))
+    if morning_open and morning_close:
+        hours.append(f"{morning_open} - {morning_close}")
+
+    evening_open = _clean_time_label(evening.get("open"))
+    evening_close = _clean_time_label(evening.get("close"))
+    if evening_open and evening_close:
+        hours.append(f"{evening_open} - {evening_close}")
+
+    if not hours:
+        hours = ["Flexible timing"]
+
+    duration = 60
+    if place_key == "temple":
+        duration = 90
+    elif place_key == "amusement park":
+        duration = 240
+    elif place_key == "park":
+        duration = 120
+    elif place_key == "beach":
+        duration = 180
+
+    return {
+        "type": place_key,
+        "duration_min": duration,
+        "opening_hours": hours
+    }
+
+
 def normalize_accessibility(modes):
     if not isinstance(modes, list): return []
     normalized = []
@@ -85,14 +339,24 @@ def normalize_accessibility(modes):
     return list(set(normalized))
 
 def get_travel_cost(mode, distance_km):
-    band = "Low" if distance_km <= 5 else "Mid" if distance_km <= 15 else "High"
+    band = "Low" if distance_km <= 3 else "Mid" if distance_km <= 15 else "High"
     if mode == "Train":
         variant = "Train (Metro)" if distance_km <= 10 else "Train (MRTS)"
         return TRAVEL_FARE_CHART[variant][band], variant
     return TRAVEL_FARE_CHART.get(mode, TRAVEL_FARE_CHART["Cab"])[band], mode
 
 def get_place_visit_cost(place):
-    return float(place.get("avg_cost_level", 0) or 0)
+    if isinstance(place, dict):
+        name = place.get("name", "").lower()
+        cost = place.get("avg_cost_level", 0)
+    else:
+        name = str(place).lower()
+        cost = 0
+
+    if any(k in name for k in ["beach", "park", "garden", "temple"]):
+        return 0.0
+
+    return float(cost or 0)
 
 def get_route_place_cost(route):
     return round(sum(get_place_visit_cost(place) for place in route), 2)
@@ -200,7 +464,7 @@ def choose_travel_mode(origin, destination, distance_km, duration_min, force_eco
     origin_modes = set(origin.get("accessibility", []))
     dest_modes = set(destination.get("accessibility", []))
     shared = origin_modes.intersection(dest_modes)
-    priority = ("Train", "Bus", "Walk", "Cab") if force_economy else ("Cab", "Train", "Bus", "Walk")
+    priority = ("Train", "Bus", "Cab", "Walk") if force_economy else ("Bus", "Train", "Cab", "Walk")
     chosen = next((m for m in priority if m in shared), "Cab")
     cost, display_name = get_travel_cost(chosen, distance_km)
     return {
@@ -257,8 +521,30 @@ def compute_matrix(state: PlannerState):
         return state
 
     try:
-        state["matrix"] = get_distance_matrix(places, state.get("city"))
+        city = state.get("city")
+        cache_key = generate_cache_key(places, city)
+
+        cached = r.get(cache_key)
+
+        if cached:
+            print("Cache HIT")
+            state["matrix"] = deserialize_matrix(json.loads(cached))
+        else:
+            print("Cache MISS")
+            data = get_distance_matrix(places, city)
+
+            print("Distance matrix size:", len(data))
+            print("Sample entry:", next(iter(data.items())) if data else "No data")
+
+            # serialize before storing
+            serializable_data = serialize_matrix(data)
+
+            r.set(cache_key, json.dumps(serializable_data), ex=86400)
+
+            state["matrix"] = data
+
     except Exception as e:
+        print(f"Error fetching distance matrix: {e}")
         state["matrix"] = {}
 
     return state
@@ -304,16 +590,24 @@ def generate_itinerary(state: PlannerState):
         if not route:
             continue
 
-        tourist_spots, transport = [], []
+        tourist_spots = []
+        city_name = str(state.get("city", "")).strip().lower()
+        for p in route:
+            name = str(p.get("name", "")).strip().lower()
+            popularity = p.get("popularity", 0)
+            tourist_spots.append({
+                "name": name,
+                "popularity": popularity,
+                "description": f"place: {name} in {city_name}. popularity: {popularity}"
+            })
+
+        transport = []
+        time_spent = []  # can be used for more advanced time calculations in the future
         total_travel_cost = 0
         total_place_cost = get_route_place_cost(route)
 
         for i, place in enumerate(route):
-            tourist_spots.append({
-                "name": place.get("name", ""),
-                "popularity": place.get("popularity", 0),
-                "description": place.get("description", "")
-            })
+
             if i < len(route) - 1:
                 d = get_leg_matrix_entry(
                     matrix,
@@ -342,6 +636,19 @@ def generate_itinerary(state: PlannerState):
                 transport.append(leg)
                 total_travel_cost += leg.get("average_cost", 0)
 
+        route_with_duration = [
+            {
+                "name": p.get("name", ""),
+                "visit_duration_minutes": p.get(
+                    "visit_duration_minutes",
+                    get_visit_profile(p.get("name", ""))["duration_min"]
+                )
+            }
+            for p in route
+        ]
+
+        schedule = compute_itinerary_schedule(route_with_duration, transport)
+
         # QWEN GENERATES INSTRUCTIONS
 
         prompt = f"""
@@ -351,11 +658,16 @@ Your task is to generate an efficient, budget-aware itinerary that covers ALL th
 
 Places:
 {[p.get('name','') for p in route]}
-Trasport Options:
+Transport Options:
 {[f"{t.get('origin')} to {t.get('destination')} by {t.get('name')} (₹{t.get('average_cost', 0)}, {t.get('duration', 0)} mins)" for t in transport]}
 
+Visit Details:
+{time_spent}
+
 Requirements:
-- Plan the trip day-by-day with proper timing
+- Plan the trip day-by-day with proper timing by using the visit durations and transport times given.
+- Visit time should be allocated based on the type of place and its opening hours.
+- Travel time between places should be calculated using the provided transport durations.
 - Optimize route for minimum travel time and cost
 - Include transport mode (bus/train/auto/walk etc.)
 - Mention approximate travel cost for each step
@@ -401,27 +713,30 @@ Format:
             instructions = []
 
         normalized_instructions = []
-        for i, p in enumerate(route):
-            item = instructions[i] if i < len(instructions) and isinstance(instructions[i], dict) else {}
-            time_label = item.get("time") or f"{9 + i}:00 AM"
-            place_name = item.get("place_name") or p.get("name", "")
-            description = item.get("description") or p.get("description", "Visit this place and enjoy your time there.")
 
-            if not item.get("description") and i < len(transport):
-                leg = transport[i]
+        for i, step in enumerate(schedule):
+            leg = transport[i-1] if i > 0 else None
+
+            description = ""
+
+            if leg:
                 description = (
-                    f"Take {leg.get('name')} from {leg.get('origin')} to {leg.get('destination')}"
-                    f" costing ₹{leg.get('average_cost', 0)} and arriving around {time_label}. "
-                    f"Then spend time at {leg.get('destination')}."
+                    f"Travel from {leg.get('origin')} to {leg.get('destination')} "
+                    f"by {leg.get('name')} ({leg.get('duration')} mins, ₹{leg.get('average_cost', 0)}). "
                 )
 
+            description += (
+                f"Arrive at {step['place_name']} at {step['arrival_time']}. "
+                f"Spend {step['visit_duration']} minutes here. "
+                f"Leave at {step['departure_time']}."
+            )
+
             normalized_instructions.append({
-                "day": item.get("day", 1),
-                "time": time_label,
-                "place_name": place_name,
+                "day": step["day"],
+                "time": step["arrival_time"],
+                "place_name": step["place_name"],
                 "description": description
             })
-
         instructions = normalized_instructions
 
         plans.append({
