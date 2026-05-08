@@ -2,7 +2,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
-from planner import plan_trip, TripPlan
+from orchestration_agent import plan_trip, TripPlan
 
 app = FastAPI(title="Trip Advisor API")
 
