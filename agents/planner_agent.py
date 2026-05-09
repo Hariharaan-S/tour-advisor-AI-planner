@@ -14,11 +14,12 @@ from langchain_community.embeddings import OllamaEmbeddings
 # ---------------- QDRANT SETUP ----------------
 
 embeddings = OllamaEmbeddings(
-    model="nomic-embed-text"
+    model="nomic-embed-text",
+    base_url="http://host.docker.internal:11434"
 )
 
 client = QdrantClient(
-    url="http://localhost:6333"
+    url="http://qdrant:6333"
 )
 
 # ---------------- STATE ----------------

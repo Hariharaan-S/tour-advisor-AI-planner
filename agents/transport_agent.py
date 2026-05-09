@@ -1,9 +1,14 @@
 import hashlib
 import json
+import os
 import re
+from urllib.parse import quote_plus
 from typing import Any, Dict, List, Optional, TypedDict
 
+from dotenv import load_dotenv
 import redis
+
+load_dotenv()
 
 try:
     from google_maps_tool import get_distance_matrix
@@ -25,7 +30,7 @@ except ModuleNotFoundError:
     MongoClient = None
 
 
-r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+r = redis.Redis(host="redis", port=6379, db=0, decode_responses=True)
 
 
 class Route:
@@ -360,8 +365,16 @@ def assign_bus_route_ids(state: TransportState):
         print("Skipping bus route lookup: pymongo is not installed.")
         return state
 
+    mongo_user = os.getenv("MONGODBUSER")
+    mongo_password = quote_plus(os.getenv("MONGODBPASSWORD"))
+
+    mongo_uri = f"mongodb://{mongo_user}:{mongo_password}@mongodb:27017/tour_advisor?authSource=admin"
+
     try:
-        client = MongoClient(state.get("mongo_uri", "mongodb://localhost:27017"), serverSelectionTimeoutMS=2000)
+        client = MongoClient(
+            state.get("mongo_uri", mongo_uri),
+            serverSelectionTimeoutMS=2000
+        )
         collection_name = state.get("bus_routes_collection", "new_route_details")
         collection = client["bus_routes"][collection_name]
         print(f"Using Mongo collection: bus_routes.{collection_name}")
